@@ -25,6 +25,9 @@ Double-click `run.bat`.
   - **Microphone** — pick a specific input or leave the system default.
   - **Push to talk** — click and press any key to change it (e.g. right Alt, F9).
   - **Press Enter after typing** — sends Enter after the text, for chat boxes.
+- **Theme** — the button in the top-right cycles **☀ Light → ☾ Dark → ◐ System**.
+  `System` follows the Windows light/dark setting and updates while the app runs.
+  Your choice is saved in `config.json` and restored on the next launch.
 
 The first use of a model downloads it into `models/<model-name>/` (~75 MB for
 `tiny.en`, ~145 MB for `base.en`, ~480 MB for `small.en`). The status bar shows

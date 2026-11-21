@@ -57,6 +57,9 @@ Open the Wisper window and adjust:
 - **Microphone:** The system default or a specific connected microphone.
 - **Push to talk:** Click the key control and press any key to change the recording key.
 - **Press Enter after typing:** Add Enter after inserted text.
+- **Theme:** The button in the top-right corner cycles **Light**, **Dark**, and
+  **System**. System follows the Windows light/dark setting. The choice is saved with
+  the other settings.
 
 Settings are stored in `config.json`.
 

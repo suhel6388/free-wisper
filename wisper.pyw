@@ -1,6 +1,7 @@
 """Wisper - hold a key, speak, and the text gets typed wherever your cursor is.
 
 Push-to-talk dictation using faster-whisper running locally on this PC.
+UI built with CustomTkinter with light / dark / system appearance modes.
 """
 
 import ctypes
@@ -11,9 +12,10 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.messagebox as messagebox
 import urllib.request
-from tkinter import ttk
 
+import customtkinter as ctk
 import numpy as np
 import sounddevice as sd
 from pynput import keyboard
@@ -48,7 +50,34 @@ DEFAULTS = {
     "hotkey": "ctrl_l",
     "input_device": -1,     # -1 = system default
     "press_enter": False,
+    "appearance": "system",  # light | dark | system
 }
+
+APPEARANCE_ORDER = ("light", "dark", "system")
+APPEARANCE_META = {
+    "light": ("\u2600", "Light"),
+    "dark": ("\u263e", "Dark"),
+    "system": ("\u25d0", "System"),
+}
+
+# --------------------------------------------------------------------------- palette
+# Every colour is a (light, dark) pair, so CustomTkinter swaps it automatically.
+
+BG = ("#F5F7FB", "#0B0F19")
+CARD = ("#FFFFFF", "#151B2B")
+FIELD = ("#F1F4FA", "#1B2334")
+FIELD_HOVER = ("#E7ECF6", "#232C42")
+BORDER = ("#E3E8F0", "#232C40")
+SHADOW = ("#E9EDF5", "#05080E")
+ACCENT = ("#4F46E5", "#6366F1")
+ACCENT_HOVER = ("#4338CA", "#818CF8")
+TEXT = ("#111827", "#F8FAFC")
+MUTED = ("#6B7280", "#94A3B8")
+
+STATE_RECORDING = (("#FDECEC", "#3A1A1F"), ("#B42318", "#FDA4AF"))
+STATE_BUSY = (("#FFF6E5", "#372C15"), ("#946200", "#FBBF24"))
+STATE_ERROR = STATE_RECORDING
+STATE_CAPTURE = (("#E8EEFC", "#202844"), ("#1D4ED8", "#93B4FF"))
 
 PRETTY_KEYS = {
     "ctrl_l": "Left Ctrl",
@@ -71,11 +100,14 @@ def load_config():
     cfg = dict(DEFAULTS)
     fresh = not os.path.exists(CONFIG_PATH)
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        # utf-8-sig so a BOM from external editors does not reset the settings
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             stored = json.load(f)
         cfg.update({k: v for k, v in stored.items() if k in DEFAULTS})
     except Exception:
         pass
+    if cfg["appearance"] not in APPEARANCE_ORDER:
+        cfg["appearance"] = DEFAULTS["appearance"]
     if fresh:
         # First run: prefer a model that is already downloaded.
         for name in MODEL_CHOICES:
@@ -353,6 +385,21 @@ class Recorder:
 
 # --------------------------------------------------------------------------- transcription worker
 
+def _vad_available():
+    """Voice-activity filtering drops silence and noise-only clips."""
+    global _VAD
+    if _VAD is None:
+        try:
+            import onnxruntime  # noqa: F401  (silero VAD backend)
+            _VAD = True
+        except Exception:
+            _VAD = False
+    return _VAD
+
+
+_VAD = None
+
+
 class Worker(threading.Thread):
     """Loads the model and transcribes recordings off the UI thread."""
 
@@ -385,7 +432,8 @@ class Worker(threading.Thread):
                         audio,
                         language=language or None,
                         beam_size=1,
-                        vad_filter=False,
+                        vad_filter=_vad_available(),
+                        vad_parameters={"min_silence_duration_ms": 300},
                         condition_on_previous_text=False,
                     )
                     text = "".join(segment.text for segment in segments).strip()
@@ -417,9 +465,12 @@ class Worker(threading.Thread):
 
     def _download_progress(self, filename, done, total):
         mb = 1024 * 1024
-        name = getattr(self, "pending_name", "model")
-        if total:
-            percent = int(done * 100 / total)
+        name = self.pending_name
+        if filename != "model.bin":
+            # Tokenizer/config files are tiny; numbers would just flicker.
+            text = f"Preparing {name}..."
+        elif total:
+            percent = min(99, int(done * 100 / total))
             text = f"Downloading {name}: {percent}% ({done / mb:.0f}/{total / mb:.0f} MB)"
         else:
             text = f"Downloading {name}: {done / mb:.0f} MB"
@@ -429,15 +480,10 @@ class Worker(threading.Thread):
 # --------------------------------------------------------------------------- app
 
 class App:
-    STATUS_STYLES = {
-        "idle": ("Hold {key} and speak", "#eef1f5", "#3d4451"),
-        "recording": ("Recording - release to type", "#fde8e8", "#a02020"),
-        "busy": ("Working...", "#fff4d6", "#8a5a00"),
-        "error": ("Error - see below", "#fde8e8", "#a02020"),
-    }
     def __init__(self, root):
         self.root = root
         self.config = load_config()
+        ctk.set_appearance_mode(self.config["appearance"])
         self.events = queue.Queue()
         self.recorder = Recorder()
         self.worker = Worker(self.events)
@@ -458,94 +504,195 @@ class App:
         self.root.after(40, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # -- theme -------------------------------------------------------------
+    def _cycle_theme(self):
+        index = APPEARANCE_ORDER.index(self.config["appearance"])
+        self.set_appearance(APPEARANCE_ORDER[(index + 1) % len(APPEARANCE_ORDER)])
+
+    def set_appearance(self, mode, animate=True):
+        """light | dark | system, persisted and applied to every widget."""
+        if mode not in APPEARANCE_ORDER or mode == self.config["appearance"]:
+            self._sync_theme_button()
+            return
+        self.config["appearance"] = mode
+        save_config(self.config)
+        if animate:
+            self._animate_theme_switch(mode)
+        else:
+            ctk.set_appearance_mode(mode)
+            self._sync_theme_button()
+
+    def _animate_theme_switch(self, mode):
+        """Short alpha dip so the palette swap does not flash."""
+        down = (0.97, 0.93, 0.90)
+        up = (0.92, 0.96, 1.0)
+
+        def fade_up(i=0):
+            if i >= len(up):
+                return
+            self.root.attributes("-alpha", up[i])
+            self.root.after(16, lambda: fade_up(i + 1))
+
+        def fade_down(i=0):
+            if i < len(down):
+                self.root.attributes("-alpha", down[i])
+                self.root.after(16, lambda: fade_down(i + 1))
+                return
+            ctk.set_appearance_mode(mode)
+            self._sync_theme_button()
+            self._refresh_status()
+            fade_up()
+
+        fade_down()
+
+    def _sync_theme_button(self):
+        icon, label = APPEARANCE_META[self.config["appearance"]]
+        self.theme_btn.configure(text=f"{icon}  {label}")
+        self.root.after(30, self._apply_titlebar)
+
+    def _apply_titlebar(self):
+        """Keep the native title bar in step with the in-app palette."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            dark = ctypes.c_int(1 if ctk.get_appearance_mode() == "Dark" else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        except Exception:
+            pass
+
     # -- ui ----------------------------------------------------------------
     def _build_ui(self):
         root = self.root
         root.title("Wisper")
-        root.geometry("460x600")
-        root.minsize(420, 520)
-        root.configure(bg="#f4f6f8")
+        root.geometry("500x700")
+        root.minsize(460, 640)
+        root.configure(fg_color=BG)
 
-        header = tk.Frame(root, bg="#f4f6f8")
-        header.pack(fill="x", padx=16, pady=(14, 6))
-        tk.Label(header, text="Wisper", font=("Segoe UI", 18, "bold"),
-                 bg="#f4f6f8", fg="#1c1f26").pack(anchor="w")
-        tk.Label(header, text="Local voice typing - press, speak, release.",
-                 font=("Segoe UI", 9), bg="#f4f6f8", fg="#6b7280").pack(anchor="w")
+        header = ctk.CTkFrame(root, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(18, 10))
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(titles, text="Wisper", font=("Segoe UI", 24, "bold"),
+                     text_color=TEXT, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(titles, text="Local voice typing - press, speak, release.",
+                     font=("Segoe UI", 12), text_color=MUTED,
+                     anchor="w").pack(anchor="w", pady=(2, 0))
 
-        card = tk.Frame(root, bg="white", highlightthickness=1,
-                        highlightbackground="#e2e6ec")
-        card.pack(fill="x", padx=16, pady=(6, 10))
-        self.status = tk.Label(card, text="", font=("Segoe UI", 12, "bold"),
-                               bg="#eef1f5", fg="#3d4451", pady=16)
-        self.status.pack(fill="x")
-        self.level = ttk.Progressbar(card, maximum=1.0, value=0.0)
-        self.level.pack(fill="x", padx=1, pady=(1, 1))
-        self.hint = tk.Label(card, text="", font=("Segoe UI", 9), bg="white",
-                             fg="#6b7280", anchor="w", justify="left", pady=8,
-                             wraplength=400)
-        self.hint.pack(fill="x", padx=12)
+        self.theme_btn = ctk.CTkButton(
+            header, text="", width=108, height=34, corner_radius=17,
+            fg_color=CARD, hover_color=FIELD_HOVER, border_width=1,
+            border_color=BORDER, text_color=TEXT,
+            font=("Segoe UI Symbol", 13, "bold"), command=self._cycle_theme,
+        )
+        self.theme_btn.pack(side="right")
 
-        settings = ttk.LabelFrame(root, text="Settings")
-        settings.pack(fill="x", padx=16, pady=(0, 10))
-        settings.columnconfigure(1, weight=1)
+        # status card, with a soft shadow ring behind it
+        shadow = ctk.CTkFrame(root, fg_color=SHADOW, corner_radius=20)
+        shadow.pack(fill="x", padx=20, pady=(4, 12))
+        card = ctk.CTkFrame(shadow, fg_color=CARD, corner_radius=18,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="both", expand=True, padx=2, pady=2)
 
-        def row(r, label):
-            ttk.Label(settings, text=label).grid(row=r, column=0, sticky="w",
-                                                 padx=(10, 8), pady=4)
+        self.status_pill = ctk.CTkFrame(card, fg_color=FIELD, corner_radius=14)
+        self.status_pill.pack(fill="x", padx=12, pady=(12, 8))
+        self.status = ctk.CTkLabel(self.status_pill, text="",
+                                   font=("Segoe UI", 16, "bold"),
+                                   text_color=TEXT, height=46)
+        self.status.pack(fill="x", padx=10)
 
-        row(0, "Model")
-        self.model_var = tk.StringVar(value=self.config["model"])
-        self.model_box = ttk.Combobox(settings, textvariable=self.model_var,
-                                      values=MODEL_CHOICES, state="readonly")
-        self.model_box.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=4)
-        self.model_box.bind("<<ComboboxSelected>>", self._on_model)
+        self.level = ctk.CTkProgressBar(card, height=6, corner_radius=3,
+                                        progress_color=ACCENT, fg_color=FIELD)
+        self.level.set(0)
+        self.level.pack(fill="x", padx=14, pady=(0, 10))
 
-        row(1, "Language")
-        self.language_var = tk.StringVar(
-            value=next((l for l, c in LANGUAGE_CHOICES if c == self.config["language"]), "English"))
-        self.language_box = ttk.Combobox(settings, textvariable=self.language_var,
-                                         values=[l for l, _ in LANGUAGE_CHOICES],
-                                         state="readonly")
-        self.language_box.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=4)
-        self.language_box.bind("<<ComboboxSelected>>", self._on_language)
+        self.hint = ctk.CTkLabel(card, text="", font=("Segoe UI", 11),
+                                 text_color=MUTED, anchor="w", justify="left",
+                                 wraplength=430)
+        self.hint.pack(fill="x", padx=14, pady=(0, 12))
 
-        row(2, "Microphone")
+        # settings card
+        settings = ctk.CTkFrame(root, fg_color=CARD, corner_radius=18,
+                                border_width=1, border_color=BORDER)
+        settings.pack(fill="x", padx=20, pady=(0, 12))
+        settings.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(settings, text="Settings", font=("Segoe UI", 13, "bold"),
+                     text_color=TEXT, anchor="w").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 4))
+
+        def row(r, text):
+            ctk.CTkLabel(settings, text=text, font=("Segoe UI", 12),
+                         text_color=MUTED, anchor="w").grid(
+                row=r, column=0, sticky="w", padx=(16, 12), pady=6)
+
+        menu_style = dict(height=32, corner_radius=10, fg_color=FIELD,
+                          button_color=FIELD, button_hover_color=FIELD_HOVER,
+                          text_color=TEXT, dropdown_fg_color=CARD,
+                          dropdown_hover_color=FIELD_HOVER,
+                          dropdown_text_color=TEXT, font=("Segoe UI", 12),
+                          anchor="w")
+
+        row(1, "Model")
+        self.model_menu = ctk.CTkOptionMenu(settings, values=list(MODEL_CHOICES),
+                                            command=self._on_model, **menu_style)
+        self.model_menu.set(self.config["model"])
+        self.model_menu.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=6)
+
+        row(2, "Language")
+        self.language_menu = ctk.CTkOptionMenu(
+            settings, values=[label for label, _ in LANGUAGE_CHOICES],
+            command=self._on_language, **menu_style)
+        self.language_menu.set(next(
+            (label for label, code in LANGUAGE_CHOICES if code == self.config["language"]),
+            LANGUAGE_CHOICES[0][0]))
+        self.language_menu.grid(row=2, column=1, sticky="ew", padx=(0, 16), pady=6)
+
+        row(3, "Microphone")
         labels = [label for label, _ in self.mic_choices]
-        current = self.config["input_device"]
-        self.mic_var = tk.StringVar(
-            value=next((label for label, idx in self.mic_choices if idx == current),
-                       labels[0]))
-        self.mic_box = ttk.Combobox(settings, textvariable=self.mic_var,
-                                    values=labels, state="readonly")
-        self.mic_box.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=4)
-        self.mic_box.bind("<<ComboboxSelected>>", self._on_mic)
+        self.mic_menu = ctk.CTkOptionMenu(settings, values=labels,
+                                          command=self._on_mic, **menu_style)
+        self.mic_menu.set(next(
+            (label for label, index in self.mic_choices
+             if index == self.config["input_device"]), labels[0]))
+        self.mic_menu.grid(row=3, column=1, sticky="ew", padx=(0, 16), pady=6)
 
-        # Scrolling over a closed dropdown should not change the setting.
-        for box in (self.model_box, self.language_box, self.mic_box):
-            box.bind("<MouseWheel>", lambda _event: "break")
+        row(4, "Push to talk")
+        self.hotkey_btn = ctk.CTkButton(
+            settings, text="", height=32, corner_radius=10,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color=("#FFFFFF", "#FFFFFF"), font=("Segoe UI", 12, "bold"),
+            command=self._begin_hotkey_capture)
+        self.hotkey_btn.grid(row=4, column=1, sticky="ew", padx=(0, 16), pady=6)
 
-        row(3, "Push to talk")
-        self.hotkey_btn = ttk.Button(settings, text="", command=self._begin_hotkey_capture)
-        self.hotkey_btn.grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=4)
-
-        row(4, "")
         self.enter_var = tk.BooleanVar(value=bool(self.config["press_enter"]))
-        ttk.Checkbutton(settings, text="Press Enter after typing",
-                        variable=self.enter_var,
-                        command=self._on_enter_toggle).grid(
-            row=4, column=1, sticky="w", padx=(0, 10), pady=(2, 8))
+        self.enter_switch = ctk.CTkSwitch(
+            settings, text="Press Enter after typing", variable=self.enter_var,
+            onvalue=True, offvalue=False, command=self._on_enter_toggle,
+            font=("Segoe UI", 12), text_color=TEXT, progress_color=ACCENT,
+            fg_color=FIELD, button_color=CARD, button_hover_color=FIELD_HOVER,
+            width=210)
+        self.enter_switch.grid(row=5, column=0, columnspan=2, sticky="w",
+                               padx=16, pady=(6, 14))
 
-        history = ttk.LabelFrame(root, text="Transcriptions")
-        history.pack(fill="both", expand=True, padx=16, pady=(0, 14))
-        self.log = tk.Text(history, height=8, wrap="word", relief="flat",
-                           bg="white", fg="#1c1f26", font=("Segoe UI", 10),
-                           padx=8, pady=6, state="disabled")
-        scroll = ttk.Scrollbar(history, command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-        self.log.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        # transcriptions card
+        history = ctk.CTkFrame(root, fg_color=CARD, corner_radius=18,
+                               border_width=1, border_color=BORDER)
+        history.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+        head = ctk.CTkFrame(history, fg_color="transparent")
+        head.pack(fill="x", padx=16, pady=(12, 6))
+        ctk.CTkLabel(head, text="Transcriptions", font=("Segoe UI", 13, "bold"),
+                     text_color=TEXT).pack(side="left")
+        ctk.CTkButton(head, text="Clear", width=56, height=26, corner_radius=13,
+                      fg_color="transparent", hover_color=FIELD_HOVER,
+                      text_color=MUTED, font=("Segoe UI", 11),
+                      command=self._clear_log).pack(side="right")
 
+        self.log = ctk.CTkTextbox(
+            history, corner_radius=12, fg_color=FIELD, border_width=1,
+            border_color=BORDER, text_color=TEXT, font=("Segoe UI", 12),
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=MUTED)
+        self.log.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
+        self._sync_theme_button()
         self._sync_hotkey_button()
         self.hint.configure(text=self._model_hint())
 
@@ -556,28 +703,38 @@ class App:
 
     def _sync_hotkey_button(self):
         label = "Press any key..." if self.capturing else pretty_key(self.config["hotkey"])
-        self.hotkey_btn.configure(text=f"Change  ({label})")
+        self.hotkey_btn.configure(text=f"Hold to talk - {label}")
 
     # -- status ------------------------------------------------------------
     def _refresh_status(self):
         if self.capturing:
-            text, bg, fg = "Press a key to use for push-to-talk", "#e8eefc", "#1d4ed8"
+            text = "Press a key to use for push-to-talk"
+            pill, text_color = STATE_CAPTURE
         elif self.recording:
-            text, bg, fg = self.STATUS_STYLES["recording"]
+            text = "Recording - release to type"
+            pill, text_color = STATE_RECORDING
         elif self.busy > 0:
-            _template, bg, fg = self.STATUS_STYLES["busy"]
             text = self.busy_text
+            pill, text_color = STATE_BUSY
         else:
-            template, bg, fg = self.STATUS_STYLES["idle"]
-            text = template.format(key=pretty_key(self.config["hotkey"]))
-        self.status.configure(text=text, bg=bg, fg=fg)
+            text = f"Hold {pretty_key(self.config['hotkey'])} and speak"
+            pill, text_color = FIELD, TEXT
+        self.status.configure(text=text, text_color=text_color)
+        self.status_pill.configure(fg_color=pill)
+        # At rest the bar would show a stray accent cap, so blend it into the track.
+        self.level.configure(progress_color=ACCENT if self.recording else FIELD)
         if not self.recording:
-            self.level["value"] = 0.0
+            self.level.set(0)
 
     def _log(self, text):
         self.log.configure(state="normal")
         self.log.insert("end", text + "\n")
         self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
 
     # -- hotkey ------------------------------------------------------------
@@ -627,7 +784,7 @@ class App:
     def _stop_recording(self):
         audio, seconds, peak = self.recorder.stop()
         self.recording = False
-        self.level["value"] = 0.0
+        self.level.set(0)
         if self.shortcut_used:
             self.shortcut_used = False
             self._refresh_status()
@@ -636,13 +793,12 @@ class App:
             self._refresh_status()
             return
         self.busy += 1
-        language = dict(LANGUAGE_CHOICES).get(self.language_var.get(), "")
+        language = dict(LANGUAGE_CHOICES).get(self.language_menu.get(), "")
         self.worker.request_transcribe(self.config["model"], audio, language)
         self._refresh_status()
 
     # -- settings ----------------------------------------------------------
-    def _on_model(self, _event=None):
-        name = self.model_var.get()
+    def _on_model(self, name):
         if name == self.config["model"]:
             return
         self.config["model"] = name
@@ -652,13 +808,12 @@ class App:
         self._refresh_status()
         self.worker.request_model(name)
 
-    def _on_language(self, _event=None):
-        self.config["language"] = dict(LANGUAGE_CHOICES)[self.language_var.get()]
+    def _on_language(self, label):
+        self.config["language"] = dict(LANGUAGE_CHOICES).get(label, "")
         save_config(self.config)
 
-    def _on_mic(self, _event=None):
-        mapping = dict(self.mic_choices)
-        self.config["input_device"] = mapping.get(self.mic_var.get(), -1)
+    def _on_mic(self, label):
+        self.config["input_device"] = dict(self.mic_choices).get(label, -1)
         save_config(self.config)
 
     def _on_enter_toggle(self):
@@ -685,7 +840,7 @@ class App:
                     self._log(f"[internal error] {exc}")
         finally:
             if self.recording:
-                self.level["value"] = min(1.0, self.recorder.level * 12)
+                self.level.set(min(1.0, self.recorder.level * 12))
             self.root.after(40, self._poll)
 
     def _handle_event(self, kind, payload):
@@ -732,6 +887,8 @@ class App:
         self.root.destroy()
 
 
+# --------------------------------------------------------------------------- entry point
+
 _mutex = None
 
 
@@ -747,17 +904,14 @@ def already_running():
 
 def main():
     if already_running():
-        root = tk.Tk()
+        root = ctk.CTk()
         root.withdraw()
-        from tkinter import messagebox
-
         messagebox.showinfo("Wisper", "Wisper is already running.")
         root.destroy()
         return
-    root = tk.Tk()
-    style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
+    ctk.set_default_color_theme("blue")
+    ctk.set_appearance_mode(load_config()["appearance"])
+    root = ctk.CTk()
     App(root)
     root.mainloop()
 
